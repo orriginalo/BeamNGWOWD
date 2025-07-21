@@ -255,7 +255,8 @@ func (mp *ModsProcessor) processUnpack(m *Mod) {
 	}
 
 	for i, f := range r.File {
-		fpath := filepath.Join(extractPath, f.Name)
+		cleanPath := filepath.FromSlash(strings.ReplaceAll(f.Name, "\\", "/"))
+		fpath := filepath.Join(extractPath, cleanPath)
 
 		if f.FileInfo().IsDir() {
 			os.MkdirAll(fpath, os.ModePerm)
