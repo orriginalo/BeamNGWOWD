@@ -4,6 +4,7 @@ import (
 	"BeamNGMode-Wails/service/widgets"
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/wailsapp/wails/v2/pkg/logger"
@@ -22,16 +24,31 @@ type Mod struct {
 	URL         string
 	DownloadURL *string
 	Widget      *widgets.ProgressWidget
+	Cancelled   bool
+	Error       error
+}
+
+type ModController interface {
+	WaitIfPaused(url string) error
+	IsCancelled(url string) bool
+	MarkCompleted(url string)
 }
 
 type ModsProcessor struct {
 	Ctx             context.Context
 	URLs            []string
+	QueueMeta       map[string]QueueMeta
 	PathToMods      string
 	Logger          *logger.Logger
 	MetadataWorkers int
 	DownloadWorkers int
 	ZipWorkers      int
+	Controller      ModController
+}
+
+type QueueMeta struct {
+	Title        string
+	ThumbnailURL string
 }
 
 func NewModsProcessor(urls []string, path string, metaWorkers, downloadWorkers, zipWorkers int, context context.Context) *ModsProcessor {
@@ -43,6 +60,14 @@ func NewModsProcessor(urls []string, path string, metaWorkers, downloadWorkers, 
 		ZipWorkers:      zipWorkers,
 		Ctx:             context,
 	}
+}
+
+func (mp *ModsProcessor) SetController(controller ModController) {
+	mp.Controller = controller
+}
+
+func (mp *ModsProcessor) SetQueueMeta(meta map[string]QueueMeta) {
+	mp.QueueMeta = meta
 }
 
 func (mp *ModsProcessor) ProcessMods() {
@@ -62,7 +87,9 @@ func (mp *ModsProcessor) ProcessMods() {
 			defer metaWg.Done()
 			for m := range metaChan {
 				mp.processMetadata(&m)
-				downloadChan <- m
+				if !m.Cancelled && m.Error == nil {
+					downloadChan <- m
+				}
 			}
 		}()
 	}
@@ -73,7 +100,9 @@ func (mp *ModsProcessor) ProcessMods() {
 			defer downloadWg.Done()
 			for m := range downloadChan {
 				mp.processDownload(&m)
-				unpackChan <- m
+				if !m.Cancelled && m.Error == nil {
+					unpackChan <- m
+				}
 			}
 		}()
 	}
@@ -84,7 +113,9 @@ func (mp *ModsProcessor) ProcessMods() {
 			defer unpackWg.Done()
 			for m := range unpackChan {
 				mp.processUnpack(&m)
-				packChan <- m
+				if !m.Cancelled && m.Error == nil {
+					packChan <- m
+				}
 			}
 		}()
 	}
@@ -101,12 +132,21 @@ func (mp *ModsProcessor) ProcessMods() {
 
 	for _, url := range mp.URLs {
 		url = strings.TrimSpace(url)
+		widget := widgets.NewProgressWidget(mp.Ctx, url)
+		if meta, exists := mp.QueueMeta[url]; exists {
+			if strings.TrimSpace(meta.Title) != "" {
+				widget.SetTitle(meta.Title)
+			}
+			if strings.TrimSpace(meta.ThumbnailURL) != "" {
+				widget.SetThumb(meta.ThumbnailURL)
+			}
+		}
 		metaChan <- Mod{
 			Name:        nil,
 			PathToFile:  nil,
 			DownloadURL: nil,
 			URL:         url,
-			Widget:      widgets.NewProgressWidget(mp.Ctx, url),
+			Widget:      widget,
 		}
 	}
 
@@ -122,11 +162,17 @@ func (mp *ModsProcessor) ProcessMods() {
 }
 
 func (mp *ModsProcessor) processMetadata(m *Mod) {
+	if mp.shouldStop(m) {
+		return
+	}
 
 	// mp.ProgressBarsBox.Add(m.Widget.Container)
 
 	m.Widget.SetStatus("Получение метаданных...")
 	html := mp.getModPageHtml(m.URL)
+	if mp.shouldStop(m) {
+		return
+	}
 	m.Name = mp.getModName(html)
 	m.Widget.SetTitle(*m.Name)
 	downloadPageUrl := mp.getDownloadPageUrl(html)
@@ -137,6 +183,10 @@ func (mp *ModsProcessor) processMetadata(m *Mod) {
 			m.DownloadURL = &href
 		}
 	})
+	if m.DownloadURL == nil {
+		m.Error = errors.New("download link not found")
+		m.Widget.SetStatus("Ошибка: ссылка загрузки не найдена")
+	}
 
 	// TODO: загрузка мода
 }
@@ -185,6 +235,9 @@ func (mp *ModsProcessor) getDownloadPageUrl(html *goquery.Document) string {
 }
 
 func (mp *ModsProcessor) processDownload(m *Mod) {
+	if mp.shouldStop(m) {
+		return
+	}
 	m.Widget.SetStatus("Загрузка...")
 
 	resp, err := http.Get(*m.DownloadURL)
@@ -210,13 +263,19 @@ func (mp *ModsProcessor) processDownload(m *Mod) {
 
 	buf := make([]byte, 1024)
 	for {
+		if mp.shouldStop(m) {
+			return
+		}
 		nr, err := resp.Body.Read(buf)
 		if nr > 0 {
 			nw, ew := file.Write(buf[0:nr])
 			if nw > 0 {
 				downloaded += int64(nw)
-				progress := float64(downloaded) / float64(total)
-				m.Widget.SetProgress(progress) // обновляем UI
+				if total > 0 {
+					progress := float64(downloaded) / float64(total)
+					m.Widget.SetProgress(progress) // обновляем UI
+				}
+				m.Widget.SetProgressBytes(downloaded, total)
 			}
 			if ew != nil {
 				break
@@ -232,6 +291,9 @@ func (mp *ModsProcessor) processDownload(m *Mod) {
 
 }
 func (mp *ModsProcessor) processUnpack(m *Mod) {
+	if mp.shouldStop(m) {
+		return
+	}
 	m.Widget.SetStatus("Распаковка...")
 
 	pathToZip := *m.PathToFile
@@ -255,6 +317,9 @@ func (mp *ModsProcessor) processUnpack(m *Mod) {
 	}
 
 	for i, f := range r.File {
+		if mp.shouldStop(m) {
+			return
+		}
 		cleanPath := filepath.FromSlash(strings.ReplaceAll(f.Name, "\\", "/"))
 		fpath := filepath.Join(extractPath, cleanPath)
 
@@ -280,6 +345,9 @@ func (mp *ModsProcessor) processUnpack(m *Mod) {
 }
 
 func (mp *ModsProcessor) processPack(m *Mod) {
+	if mp.shouldStop(m) {
+		return
+	}
 	m.Widget.SetStatus("Упаковка...")
 
 	baseFolder := filepath.Join(mp.PathToMods, *m.Name, "00 - Copy to folder in My documents", "unpacked")
@@ -321,6 +389,9 @@ func (mp *ModsProcessor) processPack(m *Mod) {
 	defer zipWriter.Close()
 
 	for i, path := range files {
+		if mp.shouldStop(m) {
+			return
+		}
 		info, err := os.Stat(path)
 		if err != nil {
 			continue
@@ -361,6 +432,27 @@ func (mp *ModsProcessor) processPack(m *Mod) {
 	}
 
 	m.Widget.SetStatus("Завершено.")
+	if mp.Controller != nil {
+		mp.Controller.MarkCompleted(m.URL)
+	}
+}
+
+func (mp *ModsProcessor) shouldStop(m *Mod) bool {
+	if mp.Controller == nil {
+		return false
+	}
+	if mp.Controller.IsCancelled(m.URL) {
+		m.Cancelled = true
+		m.Widget.SetStatus("Отменено")
+		return true
+	}
+	if err := mp.Controller.WaitIfPaused(m.URL); err != nil {
+		m.Cancelled = true
+		m.Error = err
+		m.Widget.SetStatus("Отменено")
+		return true
+	}
+	return false
 }
 
 func (mp *ModsProcessor) CleanUp() {
@@ -379,11 +471,24 @@ func (mp *ModsProcessor) CleanUp() {
 			continue
 		}
 
-		err := os.RemoveAll(fullPath)
+		err := removeAllWithRetry(fullPath, 5, 250*time.Millisecond)
 		if err != nil {
-			panic(err)
+			fmt.Println("⚠️ Не удалось удалить временный файл:", fullPath, err)
 		} else {
 			fmt.Println("🧹 Удален файл:", fullPath)
 		}
 	}
+}
+
+func removeAllWithRetry(path string, attempts int, delay time.Duration) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := os.RemoveAll(path); err == nil || os.IsNotExist(err) {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(delay)
+	}
+	return lastErr
 }
